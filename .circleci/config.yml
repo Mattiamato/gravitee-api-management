@@ -133,6 +133,45 @@ commands:
                   paths:
                       - ./<< parameters.apim-ui-project >>/node_modules
 
+    build-backend-images:
+        steps:
+            - run:
+                name: Build rest api and gateway docker images
+                command: |
+                    export REST_API_PRIVATE_IMAGE_TAG=graviteeio.azurecr.io/apim-management-api:$APIM_VERSION
+                    export GATEWAY_PRIVATE_IMAGE_TAG=graviteeio.azurecr.io/apim-gateway:$APIM_VERSION
+                    
+                    docker build -f gravitee-apim-rest-api/docker/Dockerfile-dev \
+                    --build-arg GRAVITEEIO_VERSION=${APIM_VERSION} \
+                    -t ${REST_API_PRIVATE_IMAGE_TAG} \
+                    rest-api-docker-context
+                    
+                    docker build -f gravitee-apim-gateway/docker/Dockerfile-dev \
+                    --build-arg GRAVITEEIO_VERSION=${APIM_VERSION} \
+                    -t ${GATEWAY_PRIVATE_IMAGE_TAG} \
+                    gateway-docker-context
+
+    save-backend-images-in-workspace:
+        steps:
+            - run:
+                name: Save Image in Docker Cache
+                command: |
+                    mkdir -p ./docker-cache
+                  
+                    export REST_API_PRIVATE_IMAGE_TAG=graviteeio.azurecr.io/apim-management-api:$APIM_VERSION
+                    export GATEWAY_PRIVATE_IMAGE_TAG=graviteeio.azurecr.io/apim-gateway:$APIM_VERSION
+                  
+                    docker save -o ./docker-cache/apim-management-api.tar ${REST_API_PRIVATE_IMAGE_TAG}
+                    docker save -o ./docker-cache/apim-gateway.tar ${GATEWAY_PRIVATE_IMAGE_TAG}
+
+    load-backend-images-from-workspace:
+        steps:
+            - run:
+                name: Load Image from Docker Cache
+                command: |
+                  docker load < ./docker-cache/apim-management-api.tar
+                  docker load < ./docker-cache/apim-gateway.tar
+
 parameters:
     gio_action:
         type: enum
@@ -262,6 +301,7 @@ jobs:
                   at: .
             - restore-maven-cache
             - prepare-env-var
+            - get-apim-version
             - run:
                   name: "Build project"
                   command: |
@@ -271,11 +311,15 @@ jobs:
 
             - notify-on-failure
             - save-maven-cache
+            - setup_remote_docker
+            - build-backend-images
+            - save-backend-images-in-workspace
             - persist_to_workspace:
                   root: ./
                   paths:
                       - ./rest-api-docker-context
                       - ./gateway-docker-context
+                      - ./docker-cache
 
     test:
         docker:
@@ -1185,55 +1229,22 @@ jobs:
 
     e2e-test:
       docker:
-        - image: cimg/openjdk:11.0-node
-          environment:
-            - tcp.port: 8083
-        - image: mongo:4.4
-        - image: docker.elastic.co/elasticsearch/elasticsearch:7.10.1
-          environment:
-            - transport.host: localhost #2
-            - network.host: 127.0.0.1 #3
-            - http.port: 9200 #4
-            - cluster.name: es-cluster #5
-            - discovery.type: single-node #6
-            - xpack.security.enabled: false #7
-            - ES_JAVA_OPTS: "-Xms256m -Xmx256m" #8
+        - image: cimg/openjdk:11.0
       resource_class: medium
-      executor:
-        name: node-lts
-        class: medium
       steps:
         - checkout
         - attach_workspace:
             at: .
-        - webui-install:
-            apim-ui-project: gravitee-apim-e2e
-        - run:
-            name: Wait for Mongo to be up and running
-            command: timeout 15s bash -c 'until nc -vz localhost 27017; do sleep 2; done'
+        - get-apim-version
+        - setup_remote_docker
+        - load-backend-images-from-workspace
         - run:
             name: Run API & e2e tests
             command: |
-              # Remove Enterprise edition features
-              # FIXME: add a licence to be able to run Enterprise edition
-              rm rest-api-docker-context/distribution/lib/gravitee-license-node-enterprise*.jar
-              rm rest-api-docker-context/distribution/plugins/gravitee-ae-connectors-ws*.zip
-              rm rest-api-docker-context/distribution/plugins/gravitee-notifier-*.zip
-              rm rest-api-docker-context/distribution/plugins/gravitee-policy-assign-metrics-*.zip
-              rm rest-api-docker-context/distribution/plugins/gravitee-policy-data-logging-masking-*.zip
-              rm gateway-docker-context/distribution/lib/gravitee-license-node-enterprise*.jar
-              rm gateway-docker-context/distribution/plugins/gravitee-ae-connectors-ws*.zip
-              rm gateway-docker-context/distribution/plugins/gravitee-policy-assign-metrics-*.zip
-              rm gateway-docker-context/distribution/plugins/gravitee-policy-data-logging-masking-*.zip
-              # Start APIM in background
-              GIO_MAX_MEM=1024m rest-api-docker-context/distribution/bin/gravitee &
-              GIO_MAX_MEM=1024m gateway-docker-context/distribution/bin/gravitee &
-              echo "Gravitee rest-api started ! Waiting for a connection..."
-              # Wait for APIM to be up and running
-              timeout 60s bash -c 'until nc -vz localhost 8083; do sleep 2; done'
-              # Run e2e tests
-              cd gravitee-apim-e2e
-              npm run test:ci
+              APIM_REGISTRY=graviteeio.azurecr.io \
+              APIM_VERSION=$APIM_VERSION \
+              docker-compose -f ./docker/quick-setup/mongodb/docker-compose.yml -f ./docker/test/docker-compose-tests.yml -f ./docker/test/api-tests/docker-compose-api-tests.yml \
+                -p api-integration-test up -d --scale management_ui=0 --scale portal_ui=0
         - notify-on-failure
 
     publish_rpm_packages:
